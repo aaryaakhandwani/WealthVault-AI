@@ -1,9 +1,11 @@
 """Tests for pure derived calculations in Smart Liquidation Engine (Spec Section 5)."""
 
 from datetime import datetime, timezone
+import math
 
 import pytest
 
+import src.liquidation as liquidation_pkg
 from src.liquidation.calculations import (
     calculate_adjusted_return,
     calculate_gain,
@@ -13,7 +15,13 @@ from src.liquidation.calculations import (
     compute_derived_metrics,
 )
 from src.liquidation.enums import AssetClass, AssetType
-from src.liquidation.exceptions import LiquidationValidationError
+from src.liquidation.exceptions import (
+    LiquidationError,
+    LiquidationValidationError,
+    NoEligibleAssetsError,
+    NormalizationError,
+    PendingDecisionLogicError,
+)
 from src.liquidation.schemas import PortfolioAsset
 
 
@@ -36,11 +44,12 @@ class TestDerivedCalculations:
         assert calculate_tax(0.0, 0.20) == pytest.approx(0.0)
         assert calculate_tax(-15_000.0, 0.30) == pytest.approx(0.0)
 
-    def test_calculate_tax_rejects_invalid_tax_rate(self):
+    def test_calculate_tax_does_not_auto_convert_or_cap_unconfirmed_units(self):
+        assert calculate_tax(1_000.0, 15.0) == pytest.approx(15_000.0)
+
+    def test_calculate_tax_rejects_negative_tax_rate(self):
         with pytest.raises(LiquidationValidationError):
             calculate_tax(1_000.0, -0.01)
-        with pytest.raises(LiquidationValidationError):
-            calculate_tax(1_000.0, 1.01)
 
     def test_calculate_opportunity_cost(self):
         assert calculate_opportunity_cost(0.12, 50_000.0) == pytest.approx(6_000.0)
@@ -67,11 +76,13 @@ class TestDerivedCalculations:
         assert calculate_risk(0.20, 0.30) == pytest.approx(0.25)
         assert calculate_risk(0.0, 0.0) == pytest.approx(0.0)
 
-    def test_calculate_risk_rejects_negative_inputs(self):
+    def test_calculate_risk_preserves_formula_when_max_drawdown_negative(self):
+        # Unresolved DD sign convention: formula 0.5*sigma + 0.5*DD is kept verbatim.
+        assert calculate_risk(0.20, -0.10) == pytest.approx(0.05)
+
+    def test_calculate_risk_rejects_negative_volatility(self):
         with pytest.raises(LiquidationValidationError):
             calculate_risk(-0.01, 0.2)
-        with pytest.raises(LiquidationValidationError):
-            calculate_risk(0.2, -0.01)
 
     def test_non_finite_and_boolean_inputs_rejected(self):
         with pytest.raises(LiquidationValidationError):
@@ -80,6 +91,41 @@ class TestDerivedCalculations:
             calculate_opportunity_cost(float("inf"), 10.0)
         with pytest.raises(LiquidationValidationError):
             calculate_risk(True, 0.2)
+        with pytest.raises(LiquidationValidationError):
+            calculate_tax("100", 0.1)
+        with pytest.raises(LiquidationValidationError):
+            calculate_adjusted_return(None, 0.2)
+
+    def test_arithmetic_overflow_raises_validation_error(self):
+        with pytest.raises(LiquidationValidationError):
+            calculate_opportunity_cost(1e200, 1e200)
+        with pytest.raises(LiquidationValidationError):
+            calculate_tax(1e308, 10.0)
+
+    def test_negative_zero_canonicalized_to_positive_zero(self):
+        oc = calculate_opportunity_cost(-0.05, 0.0)
+        adj = calculate_adjusted_return(-0.0, 0.5)
+        tax = calculate_tax(-0.0, 0.2)
+        assert oc == 0.0 and math.copysign(1.0, oc) == 1.0
+        assert adj == 0.0 and math.copysign(1.0, adj) == 1.0
+        assert tax == 0.0 and math.copysign(1.0, tax) == 1.0
+
+
+class TestPackageExportsAndExceptions:
+    """Tests for domain exception hierarchy and public package exports."""
+
+    def test_exception_inheritance(self):
+        assert issubclass(LiquidationValidationError, LiquidationError)
+        assert issubclass(LiquidationValidationError, ValueError)
+        assert issubclass(NormalizationError, LiquidationError)
+        assert issubclass(NormalizationError, ValueError)
+        assert issubclass(NoEligibleAssetsError, LiquidationError)
+        assert issubclass(PendingDecisionLogicError, LiquidationError)
+        assert issubclass(PendingDecisionLogicError, NotImplementedError)
+
+    def test_public_exports_match_all(self):
+        for symbol in liquidation_pkg.__all__:
+            assert hasattr(liquidation_pkg, symbol)
 
 
 class TestComputeDerivedMetrics:
@@ -128,3 +174,4 @@ class TestComputeDerivedMetrics:
         assert metrics.opportunity_cost is None
         assert metrics.adjusted_return is None
         assert metrics.risk is None
+

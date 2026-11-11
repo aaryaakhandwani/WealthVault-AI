@@ -48,6 +48,18 @@ class TestMinMaxNormalize:
         assert original == snapshot
         assert result is not original
 
+    def test_extreme_finite_values_do_not_overflow_to_nan(self):
+        result = min_max_normalize([-1e308, 0.0, 1e308])
+        assert result == pytest.approx([0.0, 0.5, 1.0])
+
+        two_point = min_max_normalize([-1e308, 1e308])
+        assert two_point == pytest.approx([0.0, 1.0])
+
+    @pytest.mark.parametrize("bad_seq", ["", "123", b"", b"123", bytearray(b"123")])
+    def test_string_and_bytes_sequences_rejected(self, bad_seq):
+        with pytest.raises(NormalizationError):
+            min_max_normalize(bad_seq)
+
     @pytest.mark.parametrize(
         "bad_values",
         [
@@ -83,3 +95,21 @@ class TestMinMaxNormalizeMapping:
 
     def test_equal_values_mapping_returns_neutral(self):
         assert min_max_normalize_mapping({"a": 3.0, "b": 3.0}) == {"a": 0.5, "b": 0.5}
+
+    def test_extreme_values_mapping_returns_finite_bounds(self):
+        result = min_max_normalize_mapping({"low": -1e308, "mid": 0.0, "high": 1e308})
+        assert result == pytest.approx({"low": 0.0, "mid": 0.5, "high": 1.0})
+
+    @pytest.mark.parametrize(
+        "bad_mapping",
+        [
+            {"a": float("nan")},
+            {"a": float("inf")},
+            {"a": True},
+            {"a": "1.0"},
+        ],
+    )
+    def test_invalid_mapping_values_raise_normalization_error(self, bad_mapping):
+        with pytest.raises(NormalizationError):
+            min_max_normalize_mapping(bad_mapping)
+

@@ -24,6 +24,14 @@ def _validate_optional_number(value: Optional[float], index_or_key: object) -> O
     return numeric
 
 
+def _canonicalize_normalized(value: float) -> float:
+    """Ensure a normalized result is finite, clamped to [0.0, 1.0], with no -0.0."""
+    if not math.isfinite(value):
+        raise NormalizationError("Normalization produced a non-finite result.")
+    clamped = min(1.0, max(0.0, value))
+    return 0.0 if clamped == 0.0 else clamped
+
+
 def _normalize_validated(validated: list[Optional[float]]) -> list[float]:
     """Apply min-max normalization to a pre-validated list of optional floats."""
     if not validated:
@@ -35,13 +43,25 @@ def _normalize_validated(validated: list[Optional[float]]) -> list[float]:
 
     min_val = min(present)
     max_val = max(present)
-    span = max_val - min_val
-
-    if span == 0.0:
+    if min_val == max_val:
         return [NEUTRAL_NORMALIZED_VALUE] * len(validated)
 
+    span = max_val - min_val
+    if math.isfinite(span):
+        return [
+            NEUTRAL_NORMALIZED_VALUE
+            if v is None
+            else _canonicalize_normalized((v - min_val) / span)
+            for v in validated
+        ]
+
+    # Half-scale inputs when max_val - min_val overflows float64 (e.g. [-1e308, 1e308]).
+    half_min = min_val * 0.5
+    half_span = (max_val * 0.5) - half_min
     return [
-        NEUTRAL_NORMALIZED_VALUE if v is None else (v - min_val) / span
+        NEUTRAL_NORMALIZED_VALUE
+        if v is None
+        else _canonicalize_normalized(((v * 0.5) - half_min) / half_span)
         for v in validated
     ]
 
@@ -62,8 +82,13 @@ def min_max_normalize(values: Sequence[Optional[float]]) -> list[float]:
         New list of normalized floats in ``[0.0, 1.0]``.
 
     Raises:
-        NormalizationError: If any non-``None`` entry is non-numeric, ``bool``, ``NaN``, or infinite.
+        NormalizationError: If ``values`` is ``str``/``bytes``/``bytearray`` or any
+            non-``None`` entry is non-numeric, ``bool``, ``NaN``, or infinite.
     """
+    if isinstance(values, (str, bytes, bytearray)):
+        raise NormalizationError(
+            f"Feature sequence must be a collection of numbers, not {type(values).__name__}."
+        )
     validated = [_validate_optional_number(value, idx) for idx, value in enumerate(values)]
     return _normalize_validated(validated)
 
@@ -86,3 +111,4 @@ def min_max_normalize_mapping(values: Mapping[K, Optional[float]]) -> dict[K, fl
     validated = [_validate_optional_number(values[key], key) for key in keys]
     normalized = _normalize_validated(validated)
     return dict(zip(keys, normalized))
+

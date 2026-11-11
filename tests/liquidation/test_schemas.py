@@ -1,6 +1,6 @@
 """Tests for Smart Liquidation Engine enums and Pydantic input schemas."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -138,14 +138,113 @@ class TestPortfolioAssetSchema:
         assert asset.expected_return == -0.08
         assert asset.previous_score == -0.05
 
-    def test_unbounded_liquidity_score_allowed(self):
-        asset = PortfolioAsset(**_make_asset_payload(liquidity=85.0))
+    def test_unbounded_liquidity_and_unconfirmed_conventions_not_over_locked(self):
+        # Negative max_drawdown, tax_rate > 1 (e.g. percentage feed), and unbounded liquidity
+        # are not rejected or auto-converted while conventions remain unresolved.
+        asset = PortfolioAsset(
+            **_make_asset_payload(liquidity=85.0, max_drawdown=-0.25, tax_rate=15.0)
+        )
         assert asset.liquidity == 85.0
+        assert asset.max_drawdown == -0.25
+        assert asset.tax_rate == 15.0
+
+    def test_integer_values_coerce_to_float(self):
+        asset = PortfolioAsset(
+            **_make_asset_payload(
+                current_value=100_000,
+                purchase_value=80_000,
+                liquidity=1,
+                expected_return=0,
+                volatility=0,
+                max_drawdown=0,
+                loss_probability=0,
+                tax_rate=0,
+                previous_score=1,
+                holding_period_days=14,
+                days_since_last_sell=7,
+                target_weight=1,
+            )
+        )
+        assert asset.current_value == 100_000.0
+        assert isinstance(asset.current_value, float)
+        assert asset.target_weight == 1.0
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "current_value",
+            "purchase_value",
+            "liquidity",
+            "expected_return",
+            "volatility",
+            "max_drawdown",
+            "loss_probability",
+            "tax_rate",
+            "previous_score",
+            "holding_period_days",
+            "days_since_last_sell",
+            "target_weight",
+        ],
+    )
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_boolean_rejected_in_all_asset_float_fields(self, field, bool_val):
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**_make_asset_payload(**{field: bool_val}))
 
     @pytest.mark.parametrize("field", ["current_value", "purchase_value"])
     def test_negative_monetary_values_rejected(self, field):
         with pytest.raises(ValidationError):
             PortfolioAsset(**_make_asset_payload(**{field: -0.01}))
+
+    @pytest.mark.parametrize(
+        "missing_field",
+        [
+            "asset_id",
+            "asset_type",
+            "asset_class",
+            "timestamp",
+            "current_value",
+            "purchase_value",
+            "lock_in",
+            "maturity",
+            "sell_allowed",
+        ],
+    )
+    def test_missing_required_asset_fields_rejected(self, missing_field):
+        payload = _make_asset_payload()
+        del payload[missing_field]
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**payload)
+
+    def test_naive_timestamps_rejected(self):
+        naive = datetime(2026, 11, 1, 12, 0)
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**_make_asset_payload(timestamp=naive))
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**_make_asset_payload(purchase_timestamp=naive))
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**_make_asset_payload(last_sell_timestamp=naive))
+
+    def test_timestamp_chronology_validation(self):
+        as_of = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+        earlier = as_of - timedelta(days=10)
+        later = as_of + timedelta(minutes=1)
+        ist_offset = timezone(timedelta(hours=5, minutes=30))
+
+        # Valid chronology across mixed timezone offsets
+        valid = PortfolioAsset(
+            **_make_asset_payload(
+                timestamp=as_of,
+                purchase_timestamp=earlier.astimezone(ist_offset),
+                last_sell_timestamp=as_of.astimezone(ist_offset),
+            )
+        )
+        assert valid.purchase_timestamp is not None
+
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**_make_asset_payload(timestamp=as_of, purchase_timestamp=later))
+        with pytest.raises(ValidationError):
+            PortfolioAsset(**_make_asset_payload(timestamp=as_of, last_sell_timestamp=later))
 
     @pytest.mark.parametrize(
         "overrides",
@@ -155,11 +254,9 @@ class TestPortfolioAssetSchema:
             {"asset_type": "crypto"},
             {"asset_class": "derivatives"},
             {"volatility": -0.1},
-            {"max_drawdown": -0.05},
             {"loss_probability": -0.01},
             {"loss_probability": 1.01},
             {"tax_rate": -0.01},
-            {"tax_rate": 1.05},
             {"lock_in": 2},
             {"maturity": -1},
             {"sell_allowed": "maybe"},
@@ -243,9 +340,38 @@ class TestLiquidationRequestSchema:
                 market_state=MarketState.NEUTRAL,
                 assets=[
                     PortfolioAsset(**_make_asset_payload(asset_id="dup-1")),
-                    PortfolioAsset(**_make_asset_payload(asset_id="dup-1")),
+                    PortfolioAsset(**_make_asset_payload(asset_id=" dup-1 ")),
                 ],
             )
+
+    def test_rebalance_duplicate_stripped_asset_keys_rejected(self):
+        with pytest.raises(ValidationError):
+            RebalanceInfo(asset_target_weights={"a1": 0.4, " a1 ": 0.3})
+
+        raw_json = json.dumps({"asset_target_weights": {"a1": 0.4, " a1 ": 0.3}})
+        with pytest.raises(ValidationError):
+            RebalanceInfo.model_validate_json(raw_json)
+
+    def test_rebalance_boolean_and_invalid_values_rejected(self):
+        with pytest.raises(ValidationError):
+            RebalanceInfo(asset_target_weights={"a1": True})
+        with pytest.raises(ValidationError):
+            RebalanceInfo(asset_class_target_weights={AssetClass.EQUITY: False})
+        with pytest.raises(ValidationError):
+            RebalanceInfo(rebalance_threshold=True)
+        with pytest.raises(ValidationError):
+            RebalanceInfo(rebalance_threshold=-0.01)
+        with pytest.raises(ValidationError):
+            RebalanceInfo(asset_target_weights={"   ": 0.2})
+        with pytest.raises(ValidationError):
+            RebalanceInfo(asset_target_weights={"a1": -0.1})
+        with pytest.raises(ValidationError):
+            RebalanceInfo(asset_target_weights={"a1": 1.1})
+
+    def test_rebalance_threshold_accepts_unconfirmed_percentage_point_units(self):
+        # Spec Section 19 mentions "5-10 percentage points" without fixing decimal vs pp.
+        rebalance = RebalanceInfo(rebalance_threshold=5.0)
+        assert rebalance.rebalance_threshold == 5.0
 
     def test_rebalance_weight_sum_exceeding_one_rejected(self):
         with pytest.raises(ValidationError):
@@ -258,3 +384,108 @@ class TestLiquidationRequestSchema:
                     AssetClass.GOLD: 0.3,
                 }
             )
+
+    def test_boolean_required_amount_rejected_and_int_accepted(self):
+        with pytest.raises(ValidationError):
+            LiquidationRequest(
+                required_amount=True,
+                urgency_days=3,
+                market_state=MarketState.RISK_ON,
+                assets=[PortfolioAsset(**_make_asset_payload())],
+            )
+
+        req = LiquidationRequest(
+            required_amount=5_000,
+            urgency_days=3,
+            market_state=MarketState.RISK_ON,
+            assets=[PortfolioAsset(**_make_asset_payload())],
+        )
+        assert req.required_amount == 5_000.0
+        assert isinstance(req.required_amount, float)
+
+    def test_conflicting_target_weights_rejected_and_matching_accepted(self):
+        with pytest.raises(ValidationError):
+            LiquidationRequest(
+                required_amount=1_000.0,
+                urgency_days=3,
+                market_state=MarketState.NEUTRAL,
+                assets=[PortfolioAsset(**_make_asset_payload(asset_id="a1", target_weight=0.25))],
+                rebalance=RebalanceInfo(asset_target_weights={"a1": 0.50}),
+            )
+
+        with pytest.raises(ValidationError):
+            LiquidationRequest(
+                required_amount=1_000.0,
+                urgency_days=3,
+                market_state=MarketState.NEUTRAL,
+                assets=[
+                    PortfolioAsset(**_make_asset_payload(asset_id="a1", target_weight=0.60)),
+                    PortfolioAsset(**_make_asset_payload(asset_id="a2")),
+                ],
+                rebalance=RebalanceInfo(asset_target_weights={"a2": 0.50}),
+            )
+
+        valid = LiquidationRequest(
+            required_amount=1_000.0,
+            urgency_days=3,
+            market_state=MarketState.NEUTRAL,
+            assets=[PortfolioAsset(**_make_asset_payload(asset_id="a1", target_weight=0.40))],
+            rebalance=RebalanceInfo(asset_target_weights={"a1": 0.40}),
+        )
+        assert valid.assets[0].target_weight == 0.40
+
+    def test_empty_portfolio_schema_accepted_pending_phase_2_decision(self):
+        # Empty portfolio handling (HOLD vs validation error) is a Phase 2 decision;
+        # Phase 1 schema accepts an explicit empty list without imposing an undocumented rule.
+        request = LiquidationRequest(
+            required_amount=1_000.0,
+            urgency_days=3,
+            market_state=MarketState.NEUTRAL,
+            assets=[],
+        )
+        assert request.assets == []
+
+    @pytest.mark.parametrize(
+        "missing_field",
+        ["required_amount", "urgency_days", "market_state", "assets"],
+    )
+    def test_missing_required_request_fields_rejected(self, missing_field):
+        payload = {
+            "required_amount": 1_000.0,
+            "urgency_days": 3,
+            "market_state": "NEUTRAL",
+            "assets": [_make_asset_payload()],
+        }
+        del payload[missing_field]
+        with pytest.raises(ValidationError):
+            LiquidationRequest(**payload)
+
+    def test_json_model_validation_roundtrip_and_json_boolean_rejection(self):
+        raw_json = json.dumps(
+            {
+                "required_amount": 10_000,
+                "urgency_days": 2,
+                "market_state": "RISK_ON",
+                "assets": [
+                    {
+                        "asset_id": "eq-1",
+                        "asset_type": "stock",
+                        "asset_class": "equity",
+                        "timestamp": "2026-11-01T12:00:00Z",
+                        "current_value": 50_000,
+                        "purchase_value": 40_000,
+                        "lock_in": 0,
+                        "maturity": 0,
+                        "sell_allowed": 1,
+                    }
+                ],
+            }
+        )
+        parsed = LiquidationRequest.model_validate_json(raw_json)
+        assert parsed.required_amount == 10_000.0
+        assert parsed.assets[0].asset_type is AssetType.STOCK
+
+        bad_json = raw_json.replace('"current_value": 50000', '"current_value": true')
+        with pytest.raises(ValidationError):
+            LiquidationRequest.model_validate_json(bad_json)
+

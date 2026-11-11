@@ -64,35 +64,47 @@ No FastAPI routes, database models, or external service calls are introduced in 
 
 For each feature vector `x`:
 
+- `str`, `bytes`, and `bytearray` inputs are rejected with `NormalizationError`.
 - Empty input `[]` or `{}` returns `[]` or `{}` safely.
 - Missing entries (`None`) map to `0.5` (neutral) and are excluded when computing `min` and `max`.
 - If `max == min` across all present entries (including single-element inputs), all entries map to `0.5`.
-- Otherwise: `norm(x_i) = (x_i - min) / (max - min)`.
-- Input collections are never mutated.
+- Otherwise: `norm(x_i) = (x_i - min) / (max - min)` (with automatic `0.5` pre-scaling when `max - min` would overflow IEEE-754 `float64`, preventing `NaN`/`inf` outputs).
+- Results are bounded to `[0.0, 1.0]` with `-0.0` canonicalized to `0.0`, and input collections are never mutated.
 
 ---
 
 ## 4. Validation Rules
 
-- **Finite numbers only:** `NaN`, `+inf`, `-inf`, and `bool` values passed as numeric fields are rejected (`allow_inf_nan=False` in schemas; `LiquidationValidationError` / `NormalizationError` in pure functions).
+- **Finite numbers only & no boolean coercion:** `NaN`, `+inf`, `-inf`, and `bool` values (`True`/`False`) passed to numeric fields or normalization functions are rejected (`allow_inf_nan=False` + `StrictFloat` in schemas; `LiquidationValidationError` / `NormalizationError` in pure functions), while legitimate `int`-to-`float` conversion is preserved.
+- **Arithmetic overflow & `-0.0` canonicalization:** Derived calculations raise `LiquidationValidationError` if intermediate arithmetic overflows to `inf` and canonicalize `-0.0` results to `0.0`.
 - **Monetary values (`current_value`, `purchase_value`, `required_amount`):** Must be `>= 0.0`. `required_amount = 0.0` is permitted because Spec Section 19 allows rebalance-triggered liquidation when `R` is small or zero.
 - **Urgency (`urgency_days`):** Integer `>= 0` (booleans rejected).
-- **Non-negative risk/duration fields:** `volatility`, `max_drawdown`, `holding_period_days`, `days_since_last_sell` must be `>= 0.0` when provided.
-- **Unit-interval rates/probabilities/weights:** `loss_probability`, `tax_rate`, `target_weight`, `rebalance_threshold`, and rebalance weight map values must lie in `[0.0, 1.0]`.
-- **Rebalance target weight sums:** Partial target weights are supported per Spec Section 19 ("provided for some assets or asset_class"); each map's total must be `<= 1.0 + 1e-6`.
+- **Non-negative volatility/rate/duration fields:** `volatility`, `tax_rate`, `rebalance_threshold`, `holding_period_days`, and `days_since_last_sell` must be `>= 0.0` when provided.
+- **Bounded probabilities & portfolio weights:** `loss_probability`, `target_weight`, and rebalance weight map values must lie in `[0.0, 1.0]`.
+- **Rebalance target weight maps & conflict checks:** Partial target weights are supported per Spec Section 19 ("provided for some assets or asset_class"). Duplicate keys colliding after whitespace stripping are rejected; conflicting `PortfolioAsset.target_weight` and `RebalanceInfo.asset_target_weights[asset_id]` values are rejected; combined per-asset target weights and per-asset-class target weights must each sum to `<= 1.0 + 1e-6`.
 - **Binary flags (`lock_in`, `maturity`, `sell_allowed`):** Accept `bool` or integers `0`/`1` (and `"0"`/`"1"`/`"true"`/`"false"` strings), rejecting other numbers such as `2` or `-1`.
+- **Timezone-aware timestamps & chronology:** `timestamp`, `purchase_timestamp`, and `last_sell_timestamp` must be timezone-aware (`tzinfo` present) to avoid naive/aware `datetime` subtraction failures; `purchase_timestamp` and `last_sell_timestamp` cannot post-date `timestamp`.
 - **Asset ID uniqueness:** `asset_id` must be non-empty after whitespace trimming and unique across `LiquidationRequest.assets`.
 
 ---
 
-## 5. Assumptions
+## 5. Assumptions, Unresolved Conventions & Design Decisions
 
-1. **Consistent Currency & Horizon:** `current_value`, `purchase_value`, and `required_amount` share a single currency; `expected_return` (`mu`) uses a consistent decimal return horizon across all assets in a request.
-2. **Decimal Conventions:** `tax_rate` (`T`) and `loss_probability` (`LP`) are decimal fractions in `[0.0, 1.0]` (e.g., `0.15` for 15%), directly matching `max(0, G) * T` and `mu * (1 - LP)` without `/ 100` scaling.
-3. **Drawdown Sign Convention:** `max_drawdown` (`DD`) is passed as a non-negative magnitude (e.g., `0.25` for a 25% drawdown) so `Risk = 0.5 * sigma + 0.5 * DD` increases monotonically with drawdown severity.
-4. **Unbounded `liquidity` and `previous_score`:** Because the PDF spec (`L_i ∈`) omits explicit bounds for liquidity score and `AdjSellScore` can fall outside `[0, 1]` due to negative return terms and intelligence adjustments, neither field enforces artificial `[0, 1]` caps in Phase 1.
-5. **Missing Signal Representation:** Optional feature fields on `PortfolioAsset` default to `None` so missing upstream ML/market signals propagate cleanly to `0.5` during normalization.
-6. **In-Memory Historical Churn Inputs:** `previous_score`, `holding_period_days`, `days_since_last_sell`, `purchase_timestamp`, and `last_sell_timestamp` are optional request-level fields with no database persistence in Phase 1.
+### 5.1 Unresolved Input Conventions (Not Locked at Validation Layer)
+
+1. **Maximum Drawdown (`max_drawdown` / `DD_i`) Sign & Scale Convention:** The v1.0 PDF does not specify whether `DD_i` is supplied as a positive magnitude (`0.25`) or negative drawdown (`-0.25`). Phase 1 does not reject negative `max_drawdown` values or apply `abs(DD)` silently; `calculate_risk` preserves the exact PDF formula `0.5 * sigma + 0.5 * DD` pending Finance confirmation.
+2. **Tax Rate (`tax_rate` / `T_i`) Units:** `tax_rate` enforces `>= 0.0` without locking `<= 1.0` or auto-converting percentages to decimals. `calculate_tax` applies `max(0, G) * T` directly per the PDF; callers must ensure decimal units (e.g., `0.15`) unless/until percentage-unit normalization is specified.
+3. **Rebalance Threshold (`rebalance_threshold`) Units:** Spec Section 19 cites `"5–10 percentage points"` without specifying decimal (`0.05`) vs. percentage-point (`5.0`) API units. `RebalanceInfo` enforces `>= 0.0` without locking `<= 1.0` or auto-converting values.
+
+### 5.2 Working Assumptions & Technical Decisions
+
+1. **Consistent Currency & Horizon:** `current_value`, `purchase_value`, and `required_amount` share a single currency; `expected_return` (`mu`) uses a consistent horizon across all assets in a request.
+2. **Probability Bounds:** `loss_probability` (`LP`) uses `[0.0, 1.0]` because `AdjReturn = mu * (1 - LP)` mathematically requires a unit-interval probability.
+3. **Unbounded `liquidity` and `previous_score`:** Because the PDF spec (`L_i ∈`) omits explicit bounds for liquidity score and `AdjSellScore` can fall outside `[0, 1]` due to negative return terms and intelligence adjustments, neither field enforces artificial `[0, 1]` caps in Phase 1.
+4. **Missing Signal Representation:** Optional feature fields on `PortfolioAsset` default to `None` so missing upstream ML/market signals propagate cleanly to `0.5` during normalization.
+5. **In-Memory Historical Churn Inputs:** `previous_score`, `holding_period_days`, `days_since_last_sell`, `purchase_timestamp`, and `last_sell_timestamp` are optional request-level fields with no database persistence in Phase 1.
+6. **Float vs. `Decimal` for Monetary Values:** Phase 1 uses IEEE-754 `float` (guarded for `NaN`/`inf`/overflow and `-0.0`) rather than `decimal.Decimal` because all derived metrics feed directly into `[0.0, 1.0]` min-max normalization and quantitative scoring weights. Any migration to `Decimal` or currency-unit rounding for final execution outputs (`SellAmount_i`, realized `Tax_i`) is deferred to Phase 2 once execution/ledger precision requirements are finalized.
+7. **Future API Payload Limits (Deferred to Phase 2 API Wiring):** Phase 1 domain schemas impose no arbitrary `max_length` on `LiquidationRequest.assets`, `asset_target_weights`, or `asset_class_target_weights` so internal batch/backtest callers are unconstrained. When FastAPI endpoints are exposed in Phase 2, explicit payload bounds (e.g., `max_length` on `assets` and target-weight maps) should be enforced at the API request layer to prevent unbounded `O(N)` memory/CPU exhaustion (DoS) from untrusted payloads; exact limits should match product portfolio-size SLAs.
 
 ---
 
@@ -114,17 +126,17 @@ The following items from the specification contain ambiguities or require Financ
 
 ## 7. Test Results
 
-Command executed after all Phase 1 code edits:
+Command executed after Phase 1 review fixes:
 
 ```text
 .venv\Scripts\python.exe -m pytest -v
 ```
 
-Result: **68 passed, 1 warning in 1.86s**
+Result: **130 passed, 1 warning** (pre-existing FastAPI `StarletteDeprecationWarning`)
 
-- `tests/liquidation/test_calculations.py`: 13 passed
-- `tests/liquidation/test_normalization.py`: 17 passed
-- `tests/liquidation/test_schemas.py`: 36 passed
+- `tests/liquidation/test_calculations.py`: 19 passed
+- `tests/liquidation/test_normalization.py`: 28 passed
+- `tests/liquidation/test_schemas.py`: 81 passed
 - `tests/test_health.py`: 2 passed (existing FastAPI health checks)
 
 ---
@@ -137,3 +149,4 @@ Once Finance/Product resolves the 9 pending decisions above, Phase 2 will implem
 2. Confirmed `SellScore`, intelligence adjustments (`AdjSellScore`), and real estate policy.
 3. Stability & churn-control ordering, dynamic sell fractions (`alpha_i`), multi-asset allocation, safety layer, and single-asset override.
 4. Confidence scoring, explanation engine (`Reason_i`), and FastAPI endpoint wiring under `src/api/v1/`.
+
