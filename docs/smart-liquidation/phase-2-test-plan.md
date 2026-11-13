@@ -10,6 +10,14 @@
 
 This test plan defines the complete verification suite required for **Phase 2 (Scoring, Adjustments, Explainability, and Orchestration)** of the Smart Liquidation Engine.
 
+The suite comprises **43 test scenarios** categorized across 5 verification domains:
+- **Unit Tests:** 18 scenarios
+- **Boundary Tests:** 10 scenarios
+- **Market Regime & Urgency Tests:** 6 scenarios
+- **Explainability & Attribution Tests:** 4 scenarios
+- **Error Handling & Negative Tests:** 5 scenarios
+- **Total Scenarios:** **43**
+
 In accordance with quantitative financial software engineering standards, tests are strictly partitioned between:
 1. **Confirmed Invariants:** Ground-truth mathematical behaviors unambiguously established by the specification.
 2. **Pending Invariants:** Tests whose numerical assertions depend on decisions recorded in [`phase-2-business-decisions.md`](./phase-2-business-decisions.md).
@@ -29,13 +37,13 @@ Tests avoid hardcoding unapproved scores. Instead, they assert architectural inv
 | `test_factor_prep_single_eligible_asset` | Factor Preparation | Single eligible asset in portfolio ($|S|=1$) | Single asset meeting eligibility criteria | All normalized factors map to $0.5$ (neutral); no divide-by-zero occurs. | **Confirmed by PDF (Sec 6)** |
 | `test_weight_config_neutral_regime` | Weight Configuration | Default NEUTRAL market regime without high urgency | `MarketState.NEUTRAL`, $TU = 14$ | Factor weights equal base weights: $w_L=0.25, w_R=0.20, w_T=0.15, w_P=0.15, w_{OC}=0.15, w_E=0.10$; sum is exactly $1.00$. | **Confirmed by PDF (Sec 7 & 8)** |
 | `test_weight_config_risk_on_regime` | Weight Configuration | RISK_ON market regime without high urgency | `MarketState.RISK_ON`, $TU = 14$ | Weights adapt to: $w_L=0.20, w_R=0.15, w_T=0.15, w_P=0.10, w_{OC}=0.15, w_E=0.25$; sum is exactly $1.00$. | **Confirmed by PDF (Sec 8)** |
-| `test_weight_config_risk_off_normalized` | Weight Configuration | RISK_OFF market regime ($TU > 7$) | `MarketState.RISK_OFF`, $TU = 14$ | Weights adapt and normalize to sum to $1.00$ ($w_L \approx 0.2609, w_R \approx 0.2609, w_E \approx 0.0435$). | **Requires Approval (DEC-B01)** |
+| `test_weight_config_risk_off_policy` | Weight Configuration | RISK_OFF market regime ($TU > 7$) under configurable normalization policies | `MarketState.RISK_OFF`, $TU = 14$, parameterized across `WeightNormalizationPolicy` | Under `UNCONDITIONAL`, weights sum to $1.00$ ($w_L \approx 0.2609, w_R \approx 0.2609 \dots$); under `CONDITIONAL_ON_URGENCY`, weights retain literal PDF sum of $1.15$. | **Requires Approval (DEC-B01)** |
 | `test_weight_config_urgency_adjustment` | Weight Configuration | High urgency ($TU \le 7$) in NEUTRAL regime | `MarketState.NEUTRAL`, $TU = 3$ | $w_L \mathrel{+}= 0.10, w_E \mathrel{-}= 0.05$; all weights re-normalized to sum to $1.00$. | **Confirmed by PDF (Sec 9)** |
 | `test_sell_score_calculation_invariants` | SellScore Calculator | Linear combination of normalized factors and weights | Pre-normalized factor vector $[L_n, R_n, T_n, P_n, OC_n, E_n]$, normalized weight vector | Computes deterministic base SellScore and factor contribution breakdown vector. | **Requires Approval (DEC-A01 signs)** |
 | `test_intelligence_urgency_boost` | Intelligence Layer | Urgent liquidation ($TU \le 7$) | $TU = 5$, asset with $L_{\text{norm}} = 0.9$ | Adds $+ (0.05 \times 0.9) = +0.045$ to asset's score; reason logged as urgency liquidity preference. | **Confirmed by PDF (Sec 12)** |
 | `test_intelligence_loss_prob_penalty` | Intelligence Layer | Asset with high loss probability ($LP > 0.6$) | $LP = 0.75, LP_{\text{norm}} = 0.8$ | Adds $+ (0.05 \times 0.8) = +0.040$ to score (penalizes holding high-loss-risk asset). | **Confirmed by PDF (Sec 12)** |
-| `test_intelligence_real_estate_option_a` | Intelligence Layer | Real estate asset under Option A default | `asset_class = REAL_ESTATE`, $L_{\text{norm}} = 0.2$ | Subtracts $- 0.05 \times (1 - 0.2) = -0.040$ from score (protects illiquid real estate). | **Requires Approval (DEC-D01)** |
-| `test_intelligence_real_estate_option_b` | Intelligence Layer | Real estate asset under Option B | `asset_class = REAL_ESTATE`, $L_{\text{norm}} = 0.2$ | Adds $+ 0.05 \times (1 - 0.2) = +0.040$ to score (prioritizes one big-ticket sale). | **Requires Approval (DEC-D01)** |
+| `test_intelligence_real_estate_protect_policy` | Intelligence Layer | Real estate asset under Option A policy (`PROTECT_ILLIQUID`) | `asset_class = REAL_ESTATE`, $L_{\text{norm}} = 0.2$, policy = `PROTECT_ILLIQUID` | Subtracts $- 0.05 \times (1 - 0.2) = -0.040$ from score (protects illiquid real estate). | **Requires Approval (DEC-D01)** |
+| `test_intelligence_real_estate_big_ticket_policy` | Intelligence Layer | Real estate asset under Option B policy (`BIG_TICKET_LIQUIDATION`) | `asset_class = REAL_ESTATE`, $L_{\text{norm}} = 0.2$, policy = `BIG_TICKET_LIQUIDATION` | Adds $+ 0.05 \times (1 - 0.2) = +0.040$ to score (prioritizes one big-ticket sale). | **Requires Approval (DEC-D01)** |
 | `test_intelligence_regime_risk_off` | Intelligence Layer | Market regime is RISK_OFF | `MarketState.RISK_OFF`, $\text{Risk}_{\text{norm}} = 0.7$ | Adds $+ (0.05 \times 0.7) = +0.035$ to score (de-risks portfolio). | **Confirmed by PDF (Sec 12)** |
 | `test_intelligence_cap_upper_bound` | Intelligence Layer | Multiple adjustments summing to $> +0.15$ | $TU=3, LP=0.8, \text{Risk}=0.9, \text{RISK\_OFF}$ | Total delta $\Delta_i$ is strictly clipped at $+0.15$; final score equals $\text{SellScore} + 0.15$. | **Confirmed by PDF (Sec 12A)** |
 | `test_intelligence_cap_lower_bound` | Intelligence Layer | Multiple adjustments summing to $< -0.15$ | Cumulative negative adjustments $< -0.15$ | Total delta $\Delta_i$ is strictly clipped at $-0.15$; final score equals $\text{SellScore} - 0.15$. | **Confirmed by PDF (Sec 12A)** |
@@ -107,3 +115,4 @@ Tests avoid hardcoding unapproved scores. Instead, they assert architectural inv
    pytest tests/liquidation/scoring/ -v --strict-markers
    ```
 4. **Acceptance Criteria:** 100% pass rate across confirmed invariants; pending invariants parameterized to run once decision register sign-offs are obtained.
+

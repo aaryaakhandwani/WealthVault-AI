@@ -50,6 +50,10 @@ This register formally documents each ambiguity, its technical and financial imp
   - *Interpretation B (Section 11 Literal):* The engine literally treats high tax and high opportunity cost as positive contributors to selling (e.g. interpreting `Tax` as "tax harvesting priority" or assuming Section 11 overrides Section 23).
   - *Interpretation C (Inverted SellScore Minimization):* `SellScore` represents retention desirability (higher = keep), so the engine should minimize `SellScore` when liquidating.
 - **Consequences:** Interpretation B leads to severe tax inefficiency. Interpretation C requires inverting all sort orders in Section 15.1. Interpretation A aligns with wealth management fiduciary standards but contradicts the literal text of Section 11.
+- **Architectural Solution:** The `SellScoreCalculator` establishes a `SellScoreFormulaStrategy` protocol parameterizing factor signs:
+  $$C_{i,k} = s_k \times w_k \times X_{i,k,\text{norm}}, \quad s_k \in \{+1, -1\}$$
+  $$\text{BaseSellScore}_i = \sum_k C_{i,k}$$
+  The engine supports interchangeable strategies (`Section11LiteralStrategy` vs. `FiduciaryCostPenaltyStrategy`) via configuration, ensuring the architecture is completely formula-agnostic until Finance provides binding sign-off.
 - **Recommended Clarification Question:** "Should `Tax_i_norm` and `OC_i_norm` have negative signs in `SellScore` so that assets with higher tax liabilities and higher opportunity costs are protected from liquidation, or does the desk intend a positive sign for tax-loss harvesting / another objective?"
 - **Approval Status:** PENDING FINANCE SIGN-OFF
 
@@ -68,13 +72,18 @@ This register formally documents each ambiguity, its technical and financial imp
   The `RISK_OFF` weights sum to **1.15**, not 1.00. The specification states in Section 9 that re-normalization occurs *if TU <= 7*, but does not specify whether `RISK_OFF` base weights must be re-normalized when $TU > 7$.
 - **Why It Matters:** If weights sum to 1.15 in `RISK_OFF` while summing to 1.00 in `NEUTRAL` and `RISK_ON`, scores across regimes cannot be compared, threshold boundaries in Section 14 ($\alpha_i$ bands: $\ge 0.70, 0.40, < 0.40$) are distorted, and intelligence adjustment caps ($\pm 0.15$) have unequal relative power.
 - **Possible Interpretations:**
-  - *Interpretation A:* Always normalize regime weights to sum to 1.00 unconditionally:
+  - *Interpretation A (Unconditional Re-normalization):* Normalize regime weights to sum to 1.00 across all regimes and urgency levels:
     $$w_k \leftarrow \frac{w_k}{\sum w}$$
     In `RISK_OFF`, $w_L \approx 0.2609, w_R \approx 0.2609, w_T \approx 0.1304, w_P \approx 0.1739, w_{OC} \approx 0.1304, w_E \approx 0.0435$.
-  - *Interpretation B:* The PDF values for $w_T$ and $w_{OC}$ in `RISK_OFF` were meant to be reduced (e.g. $w_T = 0.075, w_{OC} = 0.075$, summing to 1.00).
-  - *Interpretation C:* Retain raw weights summing to 1.15 whenever $TU > 7$.
-- **Consequences:** Interpretation C violates weight convexity and corrupts score-based dynamic allocation. Interpretation A preserves factor proportions deterministically.
-- **Recommended Clarification Question:** "Should `RISK_OFF` weights be normalized to sum to 1.00 unconditionally across all urgency levels, or should specific individual factor weights ($w_T, w_{OC}$) be revised for the `RISK_OFF` regime?"
+  - *Interpretation B (Revised Weight Profile):* The PDF values for $w_T$ and $w_{OC}$ in `RISK_OFF` were meant to be reduced (e.g. $w_T = 0.075, w_{OC} = 0.075$, summing to 1.00).
+  - *Interpretation C (Literal Specification As-Is):* Retain raw weights summing to 1.15 whenever $TU > 7$, re-normalizing only when $TU \le 7$ as specified in Section 9.
+- **Consequences:** Interpretation C violates weight convexity and corrupts score-based dynamic allocation. Interpretation A preserves factor proportions deterministically. Interpretation B requires quantitative research calibration.
+- **Architectural Solution:** To prevent software implementation from hardcoding an unapproved financial rule, the scoring engine establishes a `WeightNormalizationPolicy` strategy:
+  - `WeightNormalizationPolicy.UNCONDITIONAL`: Re-normalizes weights across all regimes to sum to 1.00.
+  - `WeightNormalizationPolicy.CONDITIONAL_ON_URGENCY`: Re-normalizes *only* when $TU \le 7$, retaining raw specification weights (summing to 1.15 in `RISK_OFF`) when $TU > 7$.
+  - `WeightNormalizationPolicy.EXPLICIT_REVISION`: Ingests an externally approved revised weight matrix.
+  The engine parameterizes this policy via configuration and selects no default until Finance confirms.
+- **Recommended Clarification Question:** "Should `RISK_OFF` weights be normalized to sum to 1.00 unconditionally across all urgency levels (`WeightNormalizationPolicy.UNCONDITIONAL`), or should specific individual factor weights ($w_T, w_{OC}$) be revised for the `RISK_OFF` regime, or should raw 1.15 weights be retained when $TU > 7$?"
 - **Approval Status:** PENDING QUANT / FINANCE SIGN-OFF
 
 ---
@@ -137,11 +146,12 @@ This register formally documents each ambiguity, its technical and financial imp
   > *Choose ONE option for production and keep it consistent.*
 - **Why It Matters:** Real estate transactions take weeks/months to close and carry high transaction friction. Option A treats real estate as a last resort; Option B treats it as a primary cash-raising mechanism for large amounts.
 - **Possible Interpretations:**
-  - *Interpretation A (Recommended Default):* Adopt Option A. Real estate has near-zero liquidity in days ($TU \le 7$); forcing sale of illiquid property for short-term liquidity is operationally unviable in retail wealth management.
-  - *Interpretation B:* Adopt Option B.
-  - *Interpretation C (Configurable Strategy):* Allow portfolio policy configuration (`real_estate_policy: Literal["PROTECT", "BIG_TICKET"]`), defaulting to Option A.
-- **Consequences:** Adopting Option B without an operational real estate disposition desk would recommend liquidating illiquid property within days.
-- **Recommended Clarification Question:** "We recommend Option A as the permanent default policy for retail portfolios. Does Product/Finance confirm Option A, or should this be configurable at the mandate level?"
+  - *Interpretation A (Protect Illiquid Real Estate):* Adopt Option A (`RealEstateStrategyPolicy.PROTECT_ILLIQUID`). Real estate has low liquidity on short horizons ($TU \le 7$); illiquid property is protected with a negative score penalty $\Delta = -0.05 \times (1 - L_{\text{norm}})$.
+  - *Interpretation B (Big-Ticket Liquidation):* Adopt Option B (`RealEstateStrategyPolicy.BIG_TICKET_LIQUIDATION`). Real estate is prioritized to satisfy large cash requirements in a single trade via $\Delta = +0.05 \times (1 - L_{\text{norm}})$.
+  - *Interpretation C (Configurable Policy — Recommended Architecture):* Establish an explicit `RealEstateStrategyPolicy` enum (`PROTECT_ILLIQUID`, `BIG_TICKET_LIQUIDATION`, `NEUTRAL`), passed via portfolio mandate configuration, with no production default hardcoded until Product confirms.
+- **Consequences:** Adopting Option B without an operational real estate disposition desk would recommend liquidating illiquid property within days. Adopting Option A prevents large single-ticket real estate sales even when appropriate for high-net-worth real estate mandates.
+- **Architectural Solution:** The `IntelligenceAdjustmentService` accepts a `RealEstateStrategyPolicy` configuration parameter. It does not hardcode Option A as an approved default, ensuring the engine remains neutral until Product signs off.
+- **Recommended Clarification Question:** "Which real estate liquidation policy should be established as the mandate default (`PROTECT_ILLIQUID` / Option A vs. `BIG_TICKET_LIQUIDATION` / Option B), or should it remain mandate-configurable?"
 - **Approval Status:** PENDING PRODUCT & DESK SIGN-OFF
 
 ---
@@ -283,3 +293,4 @@ This register formally documents each ambiguity, its technical and financial imp
 | **DEC-H01** | Confidence Score Definition | Data Science / ML Team | **PENDING** | Minor (Can use normalized placeholder) |
 | **DEC-I01** | Output Schema & HOLD Semantics | Frontend & API Gateway Lead | **PENDING** | Moderate (Affects response DTO) |
 | **DEC-J01** | Upstream Decimal Units | Data Engineering | **PENDING** | **YES — Blocker for Engine Inputs** |
+
